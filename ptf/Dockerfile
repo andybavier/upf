@@ -5,6 +5,7 @@
 
 ARG SCAPY_VER=2.4.5
 ARG TREX_VER=2.92-scapy-2.4.5
+ARG TREX_REPO=stratum/trex-core
 ARG TREX_EXT_LIBS=/external_libs
 ARG TREX_LIBS=/trex_python
 # Install dependencies for general PTF test definitions
@@ -31,13 +32,14 @@ RUN python3 -m venv /opt/ptf-venv && \
 # Install TRex traffic gen and library for TRex API
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS trex-builder
 ARG TREX_VER
+ARG TREX_REPO
 ARG TREX_EXT_LIBS
 ARG TREX_LIBS
 
 ENV TREX_SCRIPT_DIR=/trex-core-${TREX_VER}/scripts
 
 RUN apk add --no-cache wget unzip && \
-    wget https://github.com/stratum/trex-core/archive/v${TREX_VER}.zip && \
+    wget https://github.com/${TREX_REPO}/archive/v${TREX_VER}.zip && \
     unzip -qq v${TREX_VER}.zip && \
     mkdir -p /output/${TREX_EXT_LIBS} && \
     mkdir -p /output/${TREX_LIBS} && \
