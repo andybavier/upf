@@ -46,7 +46,7 @@ RUN apk add --no-cache wget unzip && \
     cp -r ${TREX_SCRIPT_DIR}/automation/trex_control_plane/stf/trex_stf_lib /output/${TREX_LIBS}
 
 # Synthesize all dependencies for runtime
-FROM ubuntu:26.04@sha256:513c074113a871b51a8d16ab445c88779d6452d937a164fb5cc479f32668a41d
+FROM ubuntu:26.04@sha256:513c074113a871b51a8d16ab445c88779d6452d937a164fb5cc479f32668a41d AS ptf-runtime-deps
 
 ARG TREX_EXT_LIBS
 ARG TREX_LIBS
@@ -80,6 +80,10 @@ ENV PYTHONPATH=${TREX_EXT_LIBS}:${TREX_LIBS}
 ENV PATH="/opt/ptf-venv/bin:${PATH}"
 
 COPY --from=trex-builder /output /
+
+# This named stage represents the fully installed runtime before the legacy
+# TRex Scapy replacement below. It is used to capture migration baselines.
+FROM ptf-runtime-deps AS ptf-runtime
 
 # Install TRex's custom Scapy so PTF tests can access its required features.
 # This intentionally replaces the checked Scapy 2.7.0 dependency. PTF 0.12.0
