@@ -113,16 +113,17 @@ func (pConn *PFCPConn) handleSessionEstablishmentRequest(msg message.Message) (m
 
 	// From here the session holds resources before it is known whether it will exist:
 	// NewPFCPSession has counted it, and parsing a CHOOSE PDR allocates the UE address
-	// (parse_pdr.go) as a side effect of reading it. A rejected establishment is never
+	// (parse_pdr.go) as a side effect of reading it. A rejected establishment is not
 	// stored and the control plane is handed no F-SEID for it, so nothing else will
-	// give either back -- not a deletion request, not the association teardown. Every
-	// way out of this function short of an accepted batch is a return, and several of
+	// give either back -- not a deletion request, not the association teardown. The one
+	// rejection that is stored, a rollback that did not finish, is below. Every way out
+	// of this function short of storing the session is a return, and several of
 	// them are inside the parse loops below, so the cleanup is deferred rather than
 	// repeated.
-	accepted := false
+	stored := false
 
 	defer func() {
-		if accepted {
+		if stored {
 			return
 		}
 
@@ -197,12 +198,38 @@ func (pConn *PFCPConn) handleSessionEstablishmentRequest(msg message.Message) (m
 	if cause == ie.CauseRequestRejected {
 		// The batch reported a failure, which means it completed and some of its rules
 		// may be programmed. Take them out before forgetting the session: nothing else
-		// will, because the session is never stored on this path and the SMF has no
-		// F-SEID to release. Best effort -- a datapath that just refused a write may
-		// refuse this one too, and there is nothing further to report it to.
-		if delCause := upf.SendMsgToUPF(
-			upfMsgTypeDel, session.PacketForwardingRules, PacketForwardingRules{},
-		); delCause == ie.CauseRequestRejected {
+		// will, because the session is not stored on this path unless this removal fails
+		// to finish, and the SMF has no F-SEID to release. Best effort -- a datapath that
+		// just refused a write may refuse this one too, and there is nothing further to
+		// report it to.
+		delCause, finished := upf.SendMsgToUPFWithCompletion(
+			upfMsgTypeDel, session.PacketForwardingRules, PacketForwardingRules{})
+		if !finished {
+			// A removal that ran out of time may have left any of the rules the refused
+			// batch programmed, and once the session is forgotten nothing names them: the
+			// control plane has no F-SEID to delete. So the session is stored after all,
+			// holding its rules and -- where this UPF allocates it -- its UE address, and
+			// the association teardown removes it like any other. The establishment is
+			// still refused.
+			logger.PfcpLog.Warnln("the rollback of a rejected session did not finish; " +
+				"keeping the session until the association is torn down")
+
+			// Set whether or not the store takes the session. If it refuses -- which it
+			// does only for a local SEID of zero -- nothing names the rules either way,
+			// and letting the cleanup run would hand the address to another UE while a
+			// rule the rollback did not remove may still match it. Holding it is the
+			// cheaper failure.
+			stored = true
+
+			err = pConn.store.PutSession(session)
+			if err != nil {
+				logger.PfcpLog.Errorf("failed to put PFCP session to store: %v", err)
+			}
+
+			return errProcessReply(ErrWriteToDatapath, ie.CauseRequestRejected)
+		}
+
+		if delCause == ie.CauseRequestRejected {
 			// A rule that could not be translated (`CreatePortRangeCartesianProduct`)
 			// or marshalled was never programmed either, so there is nothing to strand,
 			// and that is exactly what happens when the add was refused for the same
@@ -228,7 +255,7 @@ func (pConn *PFCPConn) handleSessionEstablishmentRequest(msg message.Message) (m
 			ie.CauseRequestRejected)
 	}
 
-	accepted = true
+	stored = true
 
 	err = pConn.store.PutSession(session)
 	if err != nil {
@@ -296,7 +323,13 @@ func (pConn *PFCPConn) handleSessionModificationRequest(msg message.Message) (me
 
 	session, ok := pConn.store.GetSession(localSEID)
 	if !ok {
-		return sendError(ErrNotFoundWithParam("PFCP session", "localSEID", localSEID))
+		// 29.244 clause 7.2.2.4.2: a message for a session this node has no context for
+		// is answered "Session context not found", under header SEID 0.
+		err := ErrNotFoundWithParam("PFCP session", "localSEID", localSEID)
+		logger.PfcpLog.Errorln(err)
+
+		return message.NewSessionModificationResponse(0, 0, 0, smreq.SequenceNumber, 0,
+			ie.NewCause(ie.CauseSessionContextNotFound)), err
 	}
 
 	// Parse into rules of our own. Every loop below can still refuse the message, and a
@@ -431,10 +464,21 @@ func (pConn *PFCPConn) handleSessionModificationRequest(msg message.Message) (me
 	}
 
 	session.MarkSessionQer(session.qers)
-	// TODO: since PacketForwardingRules doesn't store pointers,
-	//  we must also mark session QERs in addQERs.
-	//  We need a kind of refactoring to clean it up.
-	session.MarkSessionQer(addQERs)
+
+	// Write what the session now holds of the rules this message touched. That is not
+	// the same as what the loops above parsed: an Update following a Create of the same
+	// ID replaces the rule the Create just added, so both versions are among the parsed
+	// rules -- and written together they race, because one batch programs its rules
+	// concurrently, while the session keeps only the second. And a QER's level is the
+	// one the session's marking gave it: marked on the message's own QERs instead, a
+	// message updating one QER alone, or carrying two versions of one, is written to a
+	// table the session does not record it in.
+	addPDRs, createdPDRs = heldVersions(session.pdrs, len(before.pdrs), addPDRs[createdPDRs:],
+		func(p pdr) uint32 { return p.pdrID })
+	addFARs, createdFARs = heldVersions(session.fars, len(before.fars), addFARs[createdFARs:],
+		func(f far) uint32 { return f.farID })
+	addQERs, createdQERs = heldVersions(session.qers, len(before.qers), addQERs[createdQERs:],
+		func(q qer) uint32 { return q.qerID })
 
 	updated := PacketForwardingRules{
 		pdrs: addPDRs,
@@ -464,8 +508,9 @@ func (pConn *PFCPConn) handleSessionModificationRequest(msg message.Message) (me
 		// occupies -- or that have no version of their own before the message at all.
 		// UpdatePDR and UpdateQER find their rule in the session as the message has built
 		// it so far, so an Update following a Create of the same ID replaces the rule that
-		// Create just added, and the write programs both. The restore writes nothing for
-		// such a rule, so removing it cannot take out anything the restore puts back.
+		// Create just added, and only that final version is written. The restore writes
+		// nothing for such a rule, so removing it cannot take out anything the restore
+		// puts back.
 		//
 		// The second set is the one nothing else would ever reach. The restore below
 		// re-adds the old key; it does not remove the new one, and the session's later
@@ -619,10 +664,15 @@ func (pConn *PFCPConn) handleSessionDeletionRequest(msg message.Message) (messag
 		return nil, errUnmarshal(errMsgUnexpectedType)
 	}
 
+	// Zero until the session is found. The lookup's own refusal is answered separately
+	// below; every refusal after it is for a session the control plane has an SEID for,
+	// and carries it.
+	var remoteSEID uint64
+
 	sendError := func(err error) (message.Message, error) {
 		smres := message.NewSessionDeletionResponse(0, /* MO?? <-- what's this */
 			0,                                    /* FO <-- what's this? */
-			0,                                    /* seid */
+			remoteSEID,                           /* seid */
 			sdreq.SequenceNumber,                 /* seq # */
 			0,                                    /* priority */
 			ie.NewCause(ie.CauseRequestRejected), /* accept it blindly for the time being */
@@ -636,11 +686,38 @@ func (pConn *PFCPConn) handleSessionDeletionRequest(msg message.Message) (messag
 
 	session, ok := pConn.store.GetSession(localSEID)
 	if !ok {
-		return sendError(ErrNotFoundWithParam("PFCP session", "localSEID", localSEID))
+		// 29.244 clause 7.2.2.4.2: a message for a session this node has no context for
+		// is answered "Session context not found", under header SEID 0.
+		err := ErrNotFoundWithParam("PFCP session", "localSEID", localSEID)
+
+		return message.NewSessionDeletionResponse(0, 0, 0, sdreq.SequenceNumber, 0,
+			ie.NewCause(ie.CauseSessionContextNotFound)), err
 	}
 
-	cause := upf.SendMsgToUPF(upfMsgTypeDel, session.PacketForwardingRules, PacketForwardingRules{})
-	if cause == ie.CauseRequestRejected {
+	remoteSEID = session.remoteSEID
+
+	// This caller needs more than the cause. A batch that ran out of time is answered
+	// accepted, which elsewhere is the answer that destroys nothing -- but here accepted
+	// is what releases the address and forgets the session, and the session is the only
+	// thing that still names the rules the batch may not have removed. Once it is gone,
+	// no later message can name them: the control plane has been told it is gone too.
+	//
+	// So an unfinished deletion keeps the session and is refused. That costs the session
+	// rather than the rules: a control plane that retries converges, because a delete of a
+	// rule the datapath no longer holds is answered success, and one that does not leaves
+	// the session here until the association is torn down -- counted, logged, and removed
+	// at teardown with its rules still named. Where this UPF allocates the UE addresses it
+	// also holds the address meanwhile, so that no other UE is given one a surviving rule
+	// still matches; where the control plane allocates them there is no pool here to hold
+	// it in, and the address goes back to the control plane's regardless.
+	//
+	// A modification that removes rules must not do the same. Its session is live and is
+	// kept whatever the answer, and refusing would send it into a rollback whose restore
+	// the late removal could then undo. That is why this is decided here and not in
+	// SendMsgToUPF.
+	cause, finished := upf.SendMsgToUPFWithCompletion(
+		upfMsgTypeDel, session.PacketForwardingRules, PacketForwardingRules{})
+	if cause == ie.CauseRequestRejected || !finished {
 		return sendError(ErrWriteToDatapath)
 	}
 
