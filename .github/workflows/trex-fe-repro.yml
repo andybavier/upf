@@ -31,7 +31,14 @@ jobs:
       - name: Download TRex server release
         if: steps.trex-cache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL --retry 3 -o trex-release.tar.gz \
+          set -eux
+          # trex-tgn.cisco.com omits its intermediate certificate, so fetch it
+          # from the issuer (the leaf's AIA URL) and verify against it too.
+          curl -fsSL --retry 3 -o hydrantid.p7c \
+            http://validation.identrust.com/certs/hydrantidcaO1.p7c
+          openssl pkcs7 -inform DER -print_certs -in hydrantid.p7c \
+            | cat /etc/ssl/certs/ca-certificates.crt - > ca-bundle.crt
+          curl -fsSL --retry 3 --cacert ca-bundle.crt -o trex-release.tar.gz \
             "https://trex-tgn.cisco.com/trex/release/${TREX_VERSION}.tar.gz"
       - name: Set up hugepages and veth pairs
         run: |
