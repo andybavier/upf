@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Intel Corporation
+# Scratch workflow: reproduce, without a UPF, linerate packets leaving TRex
+# with the template IP.dst (127.0.0.1) instead of the field engine's value.
+name: TRex field-engine repro
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - scratch/trex-fe-repro
+permissions:
+  contents: read
+env:
+  TREX_VERSION: v3.06
+jobs:
+  repro:
+    name: Send the baseline stream through a software-mode TRex server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build PTF image
+        run: make -C ptf image
+      - name: Restore TRex server release
+        id: trex-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: trex-release.tar.gz
+          key: trex-server-${{ env.TREX_VERSION }}
+      - name: Download TRex server release
+        if: steps.trex-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL --retry 3 -o trex-release.tar.gz \
+            "https://trex-tgn.cisco.com/trex/release/${TREX_VERSION}.tar.gz"
+      - name: Set up hugepages and veth pairs
+        run: |
+          set -eux
+          sudo sysctl -w vm.nr_hugepages=2048
+          grep Huge /proc/meminfo
+          # TRex sends on veth0/veth1; the kernel captures on their peers.
+          for i in 0 1; do
+            sudo ip link add "veth$i" type veth peer name "veth${i}p"
+            sudo ip link set "veth$i" up
+            sudo ip link set "veth${i}p" up
+            sudo ip link set "veth${i}p" promisc on
+            sudo sysctl -w "net.ipv6.conf.veth$i.disable_ipv6=1" \
+              "net.ipv6.conf.veth${i}p.disable_ipv6=1"
+          done
+      - name: Start TRex server
+        run: |
+          set -eux
+          mkdir trex out
+          tar -xzf trex-release.tar.gz -C trex --strip-components=1
+          # Same ports and MACs as ptf/config/trex-cfg-for-ptf.yaml, but on
+          # veths through DPDK's af_packet driver instead of physical NICs.
+          cat > out/trex_cfg.yaml <<'EOF'
+          - version: 2
+            port_limit: 2
+            interfaces: ['--vdev=net_af_packet0,iface=veth0', '--vdev=net_af_packet1,iface=veth1']
+            port_info:
+              - src_mac: 40:a6:b7:20:c8:24
+                dest_mac: 40:a6:b7:20:4f:b8
+              - src_mac: 40:a6:b7:20:c8:25
+                dest_mac: 40:a6:b7:20:4f:b9
+          EOF
+          cd trex
+          # The arguments ptf_runner.py passes to the TRex daemon by default.
+          sudo nohup ./t-rex-64 -i --software --no-hw-flow-stat \
+            --cfg "$GITHUB_WORKSPACE/out/trex_cfg.yaml" -c 1 --iom 0 \
+            > "$GITHUB_WORKSPACE/out/trex-server.log" 2>&1 &
+          for _ in $(seq 120); do
+            if ss -ltn | grep -q ':4501 '; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$GITHUB_WORKSPACE/out/trex-server.log"
+          exit 1
+      - name: Send and capture the baseline stream
+        run: |
+          set -eux
+          ptf() {
+            docker run --rm --network host \
+              -v "$GITHUB_WORKSPACE/ptf:/upf-tests:ro" \
+              -v "$GITHUB_WORKSPACE/out:/out" \
+              bess-upf-ptf \
+              sh -ec 'PYTHONPATH="/upf-tests/lib:/upf-tests/tests/linerate:${PYTHONPATH}" exec python3 /upf-tests/trex-fe-repro.py "$@"' \
+              trex-fe-repro "$@"
+          }
+          # UPF_CORE_PORT (1) sends, so capture on veth1's peer.
+          for variant in latency plain; do
+            sudo tcpdump -i veth1p -U -w "out/$variant.pcap" &
+            tcpdump_pid=$!
+            sleep 2
+            ptf send --variant "$variant" | tee "out/$variant-send.txt"
+            sleep 2
+            sudo kill -INT "$tcpdump_pid"
+            wait "$tcpdump_pid" || true
+            sudo chmod a+r "out/$variant.pcap"
+          done
+          {
+            echo '## IP.dst of packets TRex sent'
+            echo '```'
+            for variant in latency plain; do
+              ptf analyze "/out/$variant.pcap"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload captures and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trex-fe-repro
+          path: out/
+          if-no-files-found: warn
