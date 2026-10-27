@@ -70,6 +70,7 @@ jobs:
           cat > out/trex_cfg.yaml <<'EOF'
           - version: 2
             port_limit: 2
+            c: 2
             interfaces: ['--vdev=net_af_packet0,iface=veth0', '--vdev=net_af_packet1,iface=veth1']
             port_info:
               - src_mac: 40:a6:b7:20:c8:24
@@ -82,7 +83,7 @@ jobs:
           # The arguments ptf_runner.py passes to the TRex daemon by default,
           # minus the Scapy server, which only serves the TRex GUI.
           sudo nohup ./t-rex-64 -i --software --no-hw-flow-stat \
-            --cfg /opt/trex/trex_cfg.yaml -c 1 --iom 0 --no-scapy-server \
+            --cfg /opt/trex/trex_cfg.yaml --iom 0 --no-scapy-server \
             > "$GITHUB_WORKSPACE/out/trex-server.log" 2>&1 &
           trex_pid=$!
           for _ in $(seq 120); do
