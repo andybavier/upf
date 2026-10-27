@@ -57,8 +57,11 @@ jobs:
       - name: Start TRex server
         run: |
           set -eux
-          mkdir trex out
-          tar -xzf trex-release.tar.gz -C trex --strip-components=1
+          mkdir out
+          # TRex drops some helpers to user "nobody", which cannot read the
+          # workspace under /home/runner.
+          sudo mkdir /opt/trex
+          sudo tar -xzf trex-release.tar.gz -C /opt/trex --strip-components=1
           # Same ports and MACs as ptf/config/trex-cfg-for-ptf.yaml, but on
           # veths through DPDK's af_packet driver instead of physical NICs.
           cat > out/trex_cfg.yaml <<'EOF'
@@ -71,14 +74,20 @@ jobs:
               - src_mac: 40:a6:b7:20:c8:25
                 dest_mac: 40:a6:b7:20:4f:b9
           EOF
-          cd trex
-          # The arguments ptf_runner.py passes to the TRex daemon by default.
+          sudo cp out/trex_cfg.yaml /opt/trex/trex_cfg.yaml
+          cd /opt/trex
+          # The arguments ptf_runner.py passes to the TRex daemon by default,
+          # minus the Scapy server, which only serves the TRex GUI.
           sudo nohup ./t-rex-64 -i --software --no-hw-flow-stat \
-            --cfg "$GITHUB_WORKSPACE/out/trex_cfg.yaml" -c 1 --iom 0 \
+            --cfg /opt/trex/trex_cfg.yaml -c 1 --iom 0 --no-scapy-server \
             > "$GITHUB_WORKSPACE/out/trex-server.log" 2>&1 &
+          trex_pid=$!
           for _ in $(seq 120); do
             if ss -ltn | grep -q ':4501 '; then
               exit 0
+            fi
+            if ! kill -0 "$trex_pid" 2>/dev/null; then
+              break
             fi
             sleep 1
           done
