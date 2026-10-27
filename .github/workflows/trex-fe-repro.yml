@@ -62,6 +62,9 @@ jobs:
           # workspace under /home/runner.
           sudo mkdir /opt/trex
           sudo tar -xzf trex-release.tar.gz -C /opt/trex --strip-components=1
+          # TRex's bundled libstdc++ is older than the one the runner's system
+          # libraries (libicuuc) need; the system copy is backward compatible.
+          sudo rm /opt/trex/so/x86_64/libstdc++.so.6
           # Same ports and MACs as ptf/config/trex-cfg-for-ptf.yaml, but on
           # veths through DPDK's af_packet driver instead of physical NICs.
           cat > out/trex_cfg.yaml <<'EOF'
