@@ -195,7 +195,7 @@ jobs:
           # ptf_runner.py drives TRex through this daemon (port 8090), which
           # runs under the host's Python rather than the PTF image's.
           cd /opt/trex
-          sudo ./trex_daemon_server start > "$GITHUB_WORKSPACE/out/daemon-start.log" 2>&1
+          sudo ./trex_daemon_server start > "$GITHUB_WORKSPACE/out/daemon-start.log" 2>&1 || true
           sleep 5
           {
             echo "## TRex ${TREX_VERSION} daemon on $(python3 --version)"
