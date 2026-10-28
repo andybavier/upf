@@ -133,3 +133,119 @@ jobs:
           name: trex-fe-repro
           path: out/
           if-no-files-found: warn
+  rx-repro:
+    name: Loop TRex's ports and check its receive path
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build PTF image
+        run: make -C ptf image
+      - name: Restore TRex server release
+        id: trex-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: trex-release.tar.gz
+          key: trex-server-${{ env.TREX_VERSION }}
+      - name: Download TRex server release
+        if: steps.trex-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          # trex-tgn.cisco.com omits its intermediate certificate, so fetch it
+          # from the issuer (the leaf's AIA URL) and verify against it too.
+          curl -fsSL --retry 3 -o hydrantid.p7c \
+            http://validation.identrust.com/certs/hydrantidcaO1.p7c
+          openssl pkcs7 -inform DER -print_certs -in hydrantid.p7c \
+            | cat /etc/ssl/certs/ca-certificates.crt - > ca-bundle.crt
+          curl -fsSL --retry 3 --cacert ca-bundle.crt -o trex-release.tar.gz \
+            "https://trex-tgn.cisco.com/trex/release/${TREX_VERSION}.tar.gz"
+      - name: Set up hugepages and a veth loop
+        run: |
+          set -eux
+          sudo sysctl -w vm.nr_hugepages=2048
+          # TRex's two ports are the two ends of one veth pair, so everything
+          # port 1 sends arrives on port 0, standing in for the UPF.
+          sudo ip link add veth0 type veth peer name veth1
+          for i in 0 1; do
+            sudo ip link set "veth$i" up
+            sudo ip link set "veth$i" promisc on
+            sudo sysctl -w "net.ipv6.conf.veth$i.disable_ipv6=1"
+          done
+      - name: Install TRex server
+        run: |
+          set -eux
+          # See the repro job for why TRex lives in /opt/trex without its
+          # bundled libstdc++.
+          sudo mkdir /opt/trex
+          sudo tar -xzf trex-release.tar.gz -C /opt/trex --strip-components=1
+          sudo rm /opt/trex/so/x86_64/libstdc++.so.6
+      - name: Send through the loop with each memory setting and payload
+        run: |
+          set -ux
+          mkdir out
+          ptf() {
+            docker run --rm --network host \
+              -v "$GITHUB_WORKSPACE/ptf:/upf-tests:ro" \
+              -v "$GITHUB_WORKSPACE/out:/out" \
+              bess-upf-ptf \
+              sh -ec 'PYTHONPATH="/upf-tests/lib:/upf-tests/tests/linerate:${PYTHONPATH}" exec python3 /upf-tests/trex-rx-repro.py "$@"' \
+              trex-rx-repro "$@"
+          }
+          start_trex() {
+            (cd /opt/trex && sudo nohup ./t-rex-64 -i --software --no-hw-flow-stat \
+              --cfg /opt/trex/trex_cfg.yaml -c 1 --iom 0 --no-scapy-server \
+              > "$GITHUB_WORKSPACE/out/trex-server-$1.log" 2>&1) &
+            for _ in $(seq 120); do
+              if ss -ltn | grep -q ':4501 '; then
+                return 0
+              fi
+              sleep 1
+            done
+            cat "$GITHUB_WORKSPACE/out/trex-server-$1.log"
+            return 1
+          }
+          stop_trex() {
+            sudo pkill -INT -f _t-rex-64 || true
+            for _ in $(seq 30); do
+              if ! pgrep -f _t-rex-64 > /dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            sudo pkill -KILL -f _t-rex-64 || true
+            sleep 2
+          }
+          # Restart TRex for every combination so each starts with full pools;
+          # each run file holds two back-to-back runs on one server.
+          for memory in ptf default; do
+            ptf config --memory "$memory" --out "/out/trex-cfg-$memory.yaml"
+            sudo cp "out/trex-cfg-$memory.yaml" /opt/trex/trex_cfg.yaml
+            for payload in plain gtpu; do
+              if start_trex "$memory-$payload"; then
+                ptf run --payload "$payload" | tee "out/$memory-$payload.txt"
+              fi
+              stop_trex
+            done
+          done
+          {
+            echo '## TRex port 0 after ~10k packets from port 1'
+            echo
+            echo '| memory | payload | run | sent | received | ierrors | latency samples | rx xstats |'
+            echo '|---|---|---|---|---|---|---|---|'
+            for memory in ptf default; do
+              for payload in plain gtpu; do
+                grep -h '^{' "out/$memory-$payload.txt" 2>/dev/null \
+                  | jq -r --arg m "$memory" \
+                    '"| \($m) | \(.payload) | \(.run) | \(.sent) | \(.received) | \(.ierrors) | \(.latency_samples) | \(.rx_xstats | tojson) |"' \
+                  || echo "| $memory | $payload | - | no result | | | | |"
+              done
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload results and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trex-rx-repro
+          path: out/
+          if-no-files-found: warn
