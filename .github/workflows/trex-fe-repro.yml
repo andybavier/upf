@@ -223,13 +223,13 @@ jobs:
             sudo cp "out/trex-cfg-$memory.yaml" /opt/trex/trex_cfg.yaml
             for payload in plain gtpu; do
               if start_trex "$memory-$payload"; then
-                ptf run --payload "$payload" | tee "out/$memory-$payload.txt"
+                ptf run --payload "$payload" --pps 10000 | tee "out/$memory-$payload.txt"
               fi
               stop_trex
             done
           done
           {
-            echo '## TRex port 0 after ~10k packets from port 1'
+            echo '## TRex port 0 after ~100k packets from port 1'
             echo
             echo '| memory | payload | run | sent | received | ierrors | latency samples | rx xstats |'
             echo '|---|---|---|---|---|---|---|---|'
