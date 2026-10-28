@@ -134,9 +134,16 @@ jobs:
           path: out/
           if-no-files-found: warn
   rx-repro:
-    name: Loop TRex's ports and check its receive path
+    name: Loop TRex's ports and check its receive path (${{ matrix.trex_version }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The PTF client stays at v3.06; only the server version varies.
+        trex_version: [v3.06, v3.08]
+    env:
+      TREX_VERSION: ${{ matrix.trex_version }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -179,11 +186,37 @@ jobs:
           # bundled libstdc++.
           sudo mkdir /opt/trex
           sudo tar -xzf trex-release.tar.gz -C /opt/trex --strip-components=1
-          sudo rm /opt/trex/so/x86_64/libstdc++.so.6
+          sudo rm -f /opt/trex/so/x86_64/libstdc++.so.6
+      - name: Check that the TRex daemon starts
+        run: |
+          set -ux
+          mkdir -p out
+          python3 --version
+          # ptf_runner.py drives TRex through this daemon (port 8090), which
+          # runs under the host's Python rather than the PTF image's.
+          cd /opt/trex
+          sudo ./trex_daemon_server start > "$GITHUB_WORKSPACE/out/daemon-start.log" 2>&1
+          sleep 5
+          {
+            echo "## TRex ${TREX_VERSION} daemon on $(python3 --version)"
+            echo
+            if ss -ltn | grep -q ':8090 '; then
+              echo 'Daemon started and is listening on port 8090.'
+            else
+              echo 'Daemon did not start:'
+              echo
+              echo '```'
+              tail -n 20 "$GITHUB_WORKSPACE/out/daemon-start.log"
+              sudo sh -c 'tail -n 20 /var/log/trex/trex_daemon_server.log' 2>/dev/null || true
+              echo '```'
+            fi
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          sudo ./trex_daemon_server stop || true
       - name: Send through the loop with each memory setting and payload
         run: |
           set -ux
-          mkdir out
+          mkdir -p out
           ptf() {
             docker run --rm --network host \
               -v "$GITHUB_WORKSPACE/ptf:/upf-tests:ro" \
@@ -229,7 +262,7 @@ jobs:
             done
           done
           {
-            echo '## TRex port 0 after ~100k packets from port 1'
+            echo "## TRex ${TREX_VERSION} port 0 after ~100k packets from port 1"
             echo
             echo '| memory | payload | run | sent | received | ierrors | latency samples | rx xstats |'
             echo '|---|---|---|---|---|---|---|---|'
@@ -246,6 +279,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: trex-rx-repro
+          name: trex-rx-repro-${{ matrix.trex_version }}
           path: out/
           if-no-files-found: warn
