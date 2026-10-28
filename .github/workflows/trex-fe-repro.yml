@@ -218,7 +218,7 @@ jobs:
           }
           # Restart TRex for every combination so each starts with full pools;
           # each run file holds two back-to-back runs on one server.
-          for memory in ptf default; do
+          for memory in ptf default tiny; do
             ptf config --memory "$memory" --out "/out/trex-cfg-$memory.yaml"
             sudo cp "out/trex-cfg-$memory.yaml" /opt/trex/trex_cfg.yaml
             for payload in plain gtpu; do
@@ -233,7 +233,7 @@ jobs:
             echo
             echo '| memory | payload | run | sent | received | ierrors | latency samples | rx xstats |'
             echo '|---|---|---|---|---|---|---|---|'
-            for memory in ptf default; do
+            for memory in ptf default tiny; do
               for payload in plain gtpu; do
                 grep -h '^{' "out/$memory-$payload.txt" 2>/dev/null \
                   | jq -r --arg m "$memory" \

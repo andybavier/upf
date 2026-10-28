@@ -43,6 +43,12 @@ def write_config(memory: str, out: str) -> None:
     port.pop("platform", None)
     if memory == "default":
         port.pop("memory", None)
+    elif memory == "tiny":
+        # A positive control: if TRex honors the memory section, pools a
+        # sixteenth of the PTF sizes should starve the receive path.
+        port["memory"] = {
+            name: max(size // 16, 8) for name, size in port["memory"].items()
+        }
     with open(out, "w") as f:
         yaml.safe_dump(config, f, sort_keys=False)
     print(yaml.safe_dump(config, sort_keys=False))
@@ -145,7 +151,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     config_parser = commands.add_parser("config")
-    config_parser.add_argument("--memory", choices=("ptf", "default"), required=True)
+    config_parser.add_argument(
+        "--memory", choices=("ptf", "default", "tiny"), required=True
+    )
     config_parser.add_argument("--out", required=True)
     run_parser = commands.add_parser("run")
     run_parser.add_argument("--server", default="127.0.0.1")
